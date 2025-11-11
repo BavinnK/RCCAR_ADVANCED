@@ -1,20 +1,11 @@
-/********************************************************************************
- * 
- *          MECANUM ROBOT CONTROLLER - ESP32 (DEFINITIVE - IDF COMPATIBLE)
- * 
- * This version uses the low-level IDF functions for PWM to guarantee compilation
- * even if the Arduino-ESP32 environment has issues.
- * 
- * THIS IS THE FINAL VERSION FOR MOTOR CONTROL.
- * 
- ********************************************************************************/
 
-// --- LIBRARIES ---
 #include <Arduino.h>
 #include <SPI.h>
 #include <nRF24L01.h>
 #include <RF24.h>
-#include "driver/ledc.h" // This header is ESSENTIAL for the functions below
+#include "MyLD2410.h"
+#include "driver/ledc.h"
+#include <ESP32Servo.h>
 
 // =============================================================================
 // --- CONFIGURATION & PIN DEFINITIONS ---
@@ -40,17 +31,41 @@ const byte ROBOT_ADDRESS[6] = "robot";
 
 #define PWM_FREQUENCY 5000 
 #define PWM_RESOLUTION 8   
-const int DRIVE_SPEED = 230;
+const int DRIVE_SPEED = 200;
 
+#define PAN_SERVO_PIN 9
+Servo panServo;
+
+// 4. Create a variable to hold the servo's position.
+// We make it static so it remembers its value between loops.
+static int panAngle = 90; // Start looking straight ahead
+
+#define RADAR_SERIAL Serial2
+#define RADAR_RX_PIN 16
+#define RADAR_TX_PIN 17
+MyLD2410 sensor(RADAR_SERIAL);
+
+// =============================================================================
+// --- DATA STRUCTURES & SHARED VARIABLES ---
+// =============================================================================
 struct ControlPacket {
   int8_t btn_forward; int8_t btn_forward_right; int8_t btn_right;
   int8_t btn_backward_right; int8_t btn_backward; int8_t btn_backward_left;
   int8_t btn_left; int8_t btn_forward_left; int8_t btn_strfe_right;
   int8_t btn_stfre_left;
+  int8_t btn_pan_left;
+  int8_t btn_pan_right;
+  
+};
+struct RadarPacket {
+  uint8_t gate_signals[9];
 };
 
+volatile RadarPacket latestRadarData = {0};
+SemaphoreHandle_t radarDataMutex;
+
 // =============================================================================
-// --- MOTOR CONTROL FUNCTIONS (BARE-METAL / IDF STYLE) ---
+// --- INITIALIZATION & MOTOR CONTROL ---
 // =============================================================================
 void init_motors() {
   pinMode(FL_IN1_PIN, OUTPUT); pinMode(FL_IN2_PIN, OUTPUT);
@@ -82,103 +97,105 @@ void stop_all() {
   ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0); ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3);
 }
 
-// Helper function to make movement code cleaner
 void set_motor_power(int ch, int speed) {
   ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch, speed);
   ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)ch);
 }
 
-// --- MOVEMENT FUNCTIONS ---
-void move_forward() {
-    stop_all();
-    digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(FR_IN2_PIN, HIGH);
-    digitalWrite(RL_IN4_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
-void move_backward() {
-    stop_all();
-    digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(FR_IN1_PIN, HIGH);
-    digitalWrite(RL_IN3_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
-void move_right() { // Rotate Right
-    stop_all();
-    digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(RL_IN4_PIN, HIGH);
-    digitalWrite(FR_IN1_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
-void move_left() { // Rotate Left
-    stop_all();
-    digitalWrite(FR_IN2_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH);
-    digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(RL_IN3_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
-void move_strfe_right() {
-    stop_all();
-    digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH);
-    digitalWrite(FR_IN1_PIN, HIGH); digitalWrite(RL_IN3_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
-void move_strfe_left() {
-    stop_all();
-    digitalWrite(FR_IN2_PIN, HIGH); digitalWrite(RL_IN4_PIN, HIGH);
-    digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
-void move_forward_right() {
-    stop_all();
-    digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, 0);
-    set_motor_power(LEDC_CHANNEL_1, 0);           set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
-void move_forward_left() {
-    stop_all();
-    digitalWrite(FR_IN2_PIN, HIGH); digitalWrite(RL_IN4_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, 0);           set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, 0);
-}
-void move_backward_right() {
-    stop_all();
-    digitalWrite(FR_IN1_PIN, HIGH); digitalWrite(RL_IN3_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, 0);           set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED);
-    set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, 0);
-}
-void move_backward_left() {
-    stop_all();
-    digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH);
-    set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, 0);
-    set_motor_power(LEDC_CHANNEL_1, 0);           set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED);
-}
+void move_forward() { stop_all(); digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(FR_IN2_PIN, HIGH); digitalWrite(RL_IN4_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
+void move_backward() { stop_all(); digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(FR_IN1_PIN, HIGH); digitalWrite(RL_IN3_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
+void move_right() { stop_all(); digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(RL_IN4_PIN, HIGH); digitalWrite(FR_IN1_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
+void move_left() { stop_all(); digitalWrite(FR_IN2_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH); digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(RL_IN3_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
+void move_strfe_right() { stop_all(); digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH); digitalWrite(FR_IN1_PIN, HIGH); digitalWrite(RL_IN3_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
+void move_strfe_left() { stop_all(); digitalWrite(FR_IN2_PIN, HIGH); digitalWrite(RL_IN4_PIN, HIGH); digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
+void move_forward_right() { stop_all(); digitalWrite(FL_IN2_PIN, HIGH); digitalWrite(RR_IN4_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, 0); set_motor_power(LEDC_CHANNEL_1, 0); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
+void move_forward_left() { stop_all(); digitalWrite(FR_IN2_PIN, HIGH); digitalWrite(RL_IN4_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, 0); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, 0); }
+void move_backward_right() { stop_all(); digitalWrite(FR_IN1_PIN, HIGH); digitalWrite(RL_IN3_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, 0); set_motor_power(LEDC_CHANNEL_2, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_1, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_3, 0); }
+void move_backward_left() { stop_all(); digitalWrite(FL_IN1_PIN, HIGH); digitalWrite(RR_IN3_PIN, HIGH); set_motor_power(LEDC_CHANNEL_0, DRIVE_SPEED); set_motor_power(LEDC_CHANNEL_2, 0); set_motor_power(LEDC_CHANNEL_1, 0); set_motor_power(LEDC_CHANNEL_3, DRIVE_SPEED); }
 
 // =============================================================================
-// --- FREE RTOS TASK ---
+// --- FREE RTOS TASKS (CORRECTED) ---
 // =============================================================================
-void robot_control_task(void *pvParameters) {
+int gate_index = 0;
+void copy_gate_value(const byte &val, uint8_t* arr) {
+  if (gate_index < 9) {
+    arr[gate_index] = val;
+    gate_index++;
+  }
+}
+
+void radar_task(void *pvParameters) {
+  if (!sensor.begin()) { vTaskDelete(NULL); }
+
+  sensor.enhancedMode();
+  delay(500);
+
+  while (1) {
+    sensor.check();
+    uint8_t current_signals[9] = {0};
+    if (sensor.presenceDetected()) {
+      auto signals = sensor.getMovingSignals();
+      gate_index = 0;
+      signals.forEach([&](const byte &val){ copy_gate_value(val, current_signals); });
+    }
+    
+    if (xSemaphoreTake(radarDataMutex, (TickType_t)10) == pdTRUE) {
+      for(int i = 0; i < 9; i++) {
+        latestRadarData.gate_signals[i] = current_signals[i];
+      }
+      xSemaphoreGive(radarDataMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void radio_and_motor_task(void *pvParameters) {
   radio.startListening();
   while(1) {
     if (radio.available()) {
       ControlPacket controls;
       radio.read(&controls, sizeof(controls));
       
-      if (controls.btn_forward) { Serial.println("Cmd: FWD"); move_forward(); }
-      else if (controls.btn_forward_right) { Serial.println("Cmd: FWD-R"); move_forward_right(); }
-      else if (controls.btn_right) { Serial.println("Cmd: ROT-R"); move_right(); }
-      else if (controls.btn_backward_right) { Serial.println("Cmd: BCK-R"); move_backward_right(); }
-      else if (controls.btn_backward) { Serial.println("Cmd: BCK"); move_backward(); }
-      else if (controls.btn_backward_left) { Serial.println("Cmd: BCK-L"); move_backward_left(); }
-      else if (controls.btn_left) { Serial.println("Cmd: ROT-L"); move_left(); }
-      else if (controls.btn_forward_left) { Serial.println("Cmd: FWD-L"); move_forward_left(); }
-      else if (controls.btn_strfe_right) { Serial.println("Cmd: STRF-R"); move_strfe_right(); }
-      else if (controls.btn_stfre_left) { Serial.println("Cmd: STRF-L"); move_strfe_left(); }
-      else { Serial.println("Cmd: STOP"); stop_all(); }
+      if (controls.btn_forward) { move_forward(); }
+      else if (controls.btn_forward_right) { move_forward_right(); }
+      else if (controls.btn_right) { move_right(); }
+      else if (controls.btn_backward_right) { move_backward_right(); }
+      else if (controls.btn_backward) { move_backward(); }
+      else if (controls.btn_backward_left) { move_backward_left(); }
+      else if (controls.btn_left) { move_left(); }
+      else if (controls.btn_forward_left) { move_forward_left(); }
+      else if (controls.btn_strfe_right) { move_strfe_right(); }
+      else if (controls.btn_stfre_left) { move_strfe_left(); }
+      else { stop_all(); }
+
+
+      // --- NEW: Pan Servo Logic (separate block) ---
+      if (controls.btn_pan_left) {
+        panAngle += 2; // Increment angle
+      }
+      if (controls.btn_pan_right) {
+        panAngle -= 2; // Decrement angle
+      }
+
+       // Constrain the angle to prevent the servo from breaking itself
+      panAngle = constrain(panAngle, 0, 180);
+
+      // Write the final position to the servo
+      panServo.write(panAngle);
+
+      RadarPacket response_packet;
+      if (xSemaphoreTake(radarDataMutex, (TickType_t)10) == pdTRUE) {
+        for(int i = 0; i < 9; i++) {
+          response_packet.gate_signals[i] = latestRadarData.gate_signals[i];
+        }
+        xSemaphoreGive(radarDataMutex);
+      }
+      
+      radio.stopListening();
+      radio.write(&response_packet, sizeof(response_packet)); 
+      radio.startListening();
     }
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -187,25 +204,33 @@ void robot_control_task(void *pvParameters) {
 // =============================================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\nESP32 Definitive Motor Sketch (IDF-Safe) Booting...");
-
-  init_motors();
-  Serial.println("Motors Initialized (IDF Style).");
+  Serial.println("\nESP32 Final Enhanced Code Booting...");
   
-  if (!radio.begin()) {
-    Serial.println("FATAL: Radio hardware not responding!");
-    while(1);
-  }
+  init_motors();
+  Serial.println("Motors Initialized.");
+  
+  RADAR_SERIAL.begin(LD2410_BAUD_RATE, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+  
+  if (!radio.begin()) { Serial.println("FATAL: Radio failed!"); while(1); }
   radio.setChannel(76);
   radio.setDataRate(RF24_250KBPS);
   radio.setPALevel(RF24_PA_HIGH);
+  radio.openWritingPipe(ROBOT_ADDRESS);
   radio.openReadingPipe(1, ROBOT_ADDRESS);
-  Serial.println("nRF24L01 Radio Initialized.");
+  Serial.println("Radio Initialized.");
   
-  xTaskCreatePinnedToCore(
-      robot_control_task, "RobotControlTask", 4096, NULL, 1, NULL, 0);
+  radarDataMutex = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(radar_task, "RadarTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(radio_and_motor_task, "RadioMotorTask", 4096, NULL, 2, NULL, 0);
+
+  ESP32PWM::allocateTimer(0); // This is needed for the servo library
+  panServo.setPeriodHertz(50);    // Standard servo frequency
+  panServo.attach(PAN_SERVO_PIN, 500, 2500); // Attach to pin with standard pulse widths
+  panServo.write(panAngle); // Move to initial center position
+  Serial.println("Pan Servo Initialized.");
       
-  Serial.println("System Ready. Listening for commands.");
+  Serial.println("All systems go. Ready for commands.");
 }
 
 void loop() {
